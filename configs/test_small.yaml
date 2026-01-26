@@ -1,0 +1,33 @@
+# Small test configuration
+# Use this for quick functionality testing
+
+pipeline:
+  total_data_bytes: 67108864      # 64 MB (very small for quick tests)
+  network_protocol: "tcp"
+  verify_checksums: true          # Enable verification for testing
+
+  thallium:
+    progress_thread: true
+    rpc_thread_count: 2
+
+sender_to_broker:
+  message_size: 1048576           # 1 MB
+  messages_per_batch: 4           # 4 MB per batch
+  max_concurrent_batches: 2
+  transfer_mode: "rdma_registered"
+
+broker:
+  output_file: "/tmp/pipeline_test_output.dat"
+  concurrent_rdma_pulls: 2
+  ack_timing: "ack_on_persist"
+  forward_strategy: "reuse_after_persist"
+  passthrough_persist: true
+
+  abt_io:
+    concurrent_writes: 2
+
+broker_to_receiver:
+  message_size: 1048576
+  messages_per_batch: 4
+  max_concurrent_batches: 2
+  transfer_mode: "rdma_direct"

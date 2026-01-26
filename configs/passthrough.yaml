@@ -1,0 +1,33 @@
+# Passthrough configuration
+# Direct sender -> receiver transfer, broker coordinates but doesn't buffer data
+
+pipeline:
+  total_data_bytes: 107374182400  # 100 GB
+  network_protocol: "ofi+verbs"   # Use RDMA-capable network
+  verify_checksums: false
+
+  thallium:
+    progress_thread: true
+    rpc_thread_count: 4
+
+sender_to_broker:
+  message_size: 4194304           # 4 MB per message
+  messages_per_batch: 16          # 64 MB per batch
+  max_concurrent_batches: 8
+  transfer_mode: "rdma_direct"    # Must be RDMA for passthrough
+
+broker:
+  output_file: "/mnt/nvme/output.dat"
+  concurrent_rdma_pulls: 1        # Not heavily used in passthrough
+  ack_timing: "ack_on_receive"    # Ignored in passthrough (ack after receiver completes)
+  forward_strategy: "passthrough"
+  passthrough_persist: false      # Skip file I/O entirely
+
+  abt_io:
+    concurrent_writes: 1
+
+broker_to_receiver:
+  message_size: 4194304           # Must match sender
+  messages_per_batch: 16
+  max_concurrent_batches: 8
+  transfer_mode: "rdma_direct"    # Receiver pulls from sender

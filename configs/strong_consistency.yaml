@@ -1,0 +1,33 @@
+# Strong consistency configuration
+# Durability guaranteed: sender ack only after data persisted to disk
+
+pipeline:
+  total_data_bytes: 107374182400  # 100 GB
+  network_protocol: "ofi+verbs"   # Use RDMA-capable network
+  verify_checksums: true          # Enable checksum verification
+
+  thallium:
+    progress_thread: true
+    rpc_thread_count: 4
+
+sender_to_broker:
+  message_size: 1048576           # 1 MB per message
+  messages_per_batch: 32          # 32 MB per batch
+  max_concurrent_batches: 4
+  transfer_mode: "rdma_registered"
+
+broker:
+  output_file: "/mnt/nvme/output.dat"
+  concurrent_rdma_pulls: 4
+  ack_timing: "ack_on_persist"    # Ack only after write completes
+  forward_strategy: "reload_from_file"  # Reload from file to verify persistence
+  passthrough_persist: true       # Always persist
+
+  abt_io:
+    concurrent_writes: 8
+
+broker_to_receiver:
+  message_size: 1048576
+  messages_per_batch: 32
+  max_concurrent_batches: 4
+  transfer_mode: "rdma_direct"

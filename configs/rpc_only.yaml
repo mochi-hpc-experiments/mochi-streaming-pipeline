@@ -1,0 +1,34 @@
+# RPC-only configuration
+# All data transfers use RPC arguments (no RDMA)
+# Useful for testing on systems without RDMA support
+
+pipeline:
+  total_data_bytes: 107374182400  # 100 GB
+  network_protocol: "tcp"         # TCP works everywhere
+  verify_checksums: false
+
+  thallium:
+    progress_thread: true
+    rpc_thread_count: 4
+
+sender_to_broker:
+  message_size: 262144            # 256 KB (smaller for RPC)
+  messages_per_batch: 16          # 4 MB per batch
+  max_concurrent_batches: 8
+  transfer_mode: "rpc_inline"     # Data sent as RPC argument
+
+broker:
+  output_file: "/tmp/pipeline_output.dat"
+  concurrent_rdma_pulls: 1        # Not used for RPC mode
+  ack_timing: "ack_on_persist"
+  forward_strategy: "forward_immediate"
+  passthrough_persist: true
+
+  abt_io:
+    concurrent_writes: 8
+
+broker_to_receiver:
+  message_size: 262144
+  messages_per_batch: 16
+  max_concurrent_batches: 8
+  transfer_mode: "rpc_inline"     # Data sent as RPC argument

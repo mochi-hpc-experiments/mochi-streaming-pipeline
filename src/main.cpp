@@ -6,6 +6,7 @@
 #include <string>
 #include <chrono>
 #include <ctime>
+#include <memory>
 
 #include "common/config.hpp"
 #include "common/timing.hpp"
@@ -108,11 +109,7 @@ void print_results(const PipelineConfig& config, double elapsed,
 
 int main(int argc, char** argv) {
     // Initialize MPI
-    int provided;
-    MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
-    if (provided < MPI_THREAD_MULTIPLE) {
-        std::cerr << "Warning: MPI does not support MPI_THREAD_MULTIPLE" << std::endl;
-    }
+    MPI_Init(&argc, &argv);
 
     int rank, size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
@@ -187,35 +184,54 @@ int main(int argc, char** argv) {
     // Ensure all engines are ready
     MPI_Barrier(MPI_COMM_WORLD);
 
+    // Pointers to providers (only set on their respective ranks)
+    std::unique_ptr<SenderProvider> sender;
+    std::unique_ptr<BrokerProvider> broker;
+    std::unique_ptr<ReceiverProvider> receiver;
+
+    // Create providers on each rank
+    try {
+        if (rank == 0) {
+            sender = std::make_unique<SenderProvider>(
+                engine, 1, config.sender_to_broker,
+                addresses[1], config.total_data_bytes,
+                config.verify_checksums,
+                config.thallium.rpc_thread_count);
+        }
+        else if (rank == 1) {
+            broker = std::make_unique<BrokerProvider>(
+                engine, 1, config.broker,
+                config.sender_to_broker, config.broker_to_receiver,
+                addresses[2], config.total_data_bytes,
+                config.verify_checksums);
+        }
+        else {
+            receiver = std::make_unique<ReceiverProvider>(
+                engine, 1, config.broker_to_receiver,
+                config.total_data_bytes,
+                config.verify_checksums);
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "[Rank " << rank << "] Error creating provider: " << e.what() << std::endl;
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
+    // Ensure all providers are created and RPCs are registered
+    MPI_Barrier(MPI_COMM_WORLD);
+
     // Record start time
     double start_time = MPI_Wtime();
 
-    // Pointer to sender for statistics (only used on rank 0)
-    SenderProvider* sender_ptr = nullptr;
-
+    // Run the pipeline
     try {
         if (rank == 0) {
-            // SENDER
-            SenderProvider sender(engine, 1, config.sender_to_broker,
-                                  addresses[1], config.total_data_bytes,
-                                  config.verify_checksums);
-            sender_ptr = &sender;
-            sender.run();
+            sender->run();
         }
         else if (rank == 1) {
-            // BROKER
-            BrokerProvider broker(engine, 1, config.broker,
-                                  config.sender_to_broker, config.broker_to_receiver,
-                                  addresses[2], config.total_data_bytes,
-                                  config.verify_checksums);
-            broker.wait_completion();
+            broker->wait_completion();
         }
         else {
-            // RECEIVER
-            ReceiverProvider receiver(engine, 1, config.broker_to_receiver,
-                                      config.total_data_bytes,
-                                      config.verify_checksums);
-            receiver.wait_completion();
+            receiver->wait_completion();
         }
     } catch (const std::exception& e) {
         std::cerr << "[Rank " << rank << "] Error: " << e.what() << std::endl;
@@ -230,7 +246,7 @@ int main(int argc, char** argv) {
 
     // Report results from rank 0
     if (rank == 0) {
-        print_results(config, elapsed, nullptr);  // sender_ptr is out of scope
+        print_results(config, elapsed, sender.get());
         std::cout << "\n=== Benchmark Complete ===" << std::endl;
     }
 

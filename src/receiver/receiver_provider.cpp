@@ -19,7 +19,7 @@ ReceiverProvider::ReceiverProvider(tl::engine& engine, uint16_t provider_id,
         buffer_pool_ = std::make_unique<BufferPool>(
             engine_, batch_size,
             config_.max_concurrent_batches + 2,
-            tl::bulk_mode::write_only,  // We pull into these buffers
+            tl::bulk_mode::write_only,
             true
         );
     }
@@ -30,14 +30,10 @@ ReceiverProvider::ReceiverProvider(tl::engine& engine, uint16_t provider_id,
     define("receiver_batch_passthrough", &ReceiverProvider::on_passthrough);
     define("receiver_done", &ReceiverProvider::on_done);
 
-    // Get remote procedure for acking broker
-    rpc_broker_ack_ = engine_.define("broker_receiver_ack");
-
     std::cout << "[Receiver] Initialized, waiting for data..." << std::endl;
 }
 
 ReceiverProvider::~ReceiverProvider() {
-    // Buffer pool cleanup handled by unique_ptr
 }
 
 void ReceiverProvider::on_batch_rpc(const tl::request& req, uint64_t batch_id,
@@ -48,11 +44,10 @@ void ReceiverProvider::on_batch_rpc(const tl::request& req, uint64_t batch_id,
         first_recv_ = false;
     }
 
-    process_batch(batch_id, data.data(), data.size(), checksum);
+    bool ok = process_batch(batch_id, data.data(), data.size(), checksum);
 
-    // Ack broker
-    ack_broker(req.get_endpoint(), batch_id);
-    req.respond(true);
+    // Response is the ack to broker
+    req.respond(ok);
 }
 
 void ReceiverProvider::on_batch_rdma(const tl::request& req, uint64_t batch_id,
@@ -75,14 +70,13 @@ void ReceiverProvider::on_batch_rdma(const tl::request& req, uint64_t batch_id,
     // Pull from broker
     remote_bulk.on(broker_ep) >> local_bulk;
 
-    process_batch(batch_id, handle.data, size, checksum);
+    bool ok = process_batch(batch_id, handle.data, size, checksum);
 
     // Release buffer
     buffer_pool_->release(handle);
 
-    // Ack broker
-    ack_broker(broker_ep, batch_id);
-    req.respond(true);
+    // Response is the ack to broker
+    req.respond(ok);
 }
 
 void ReceiverProvider::on_passthrough(const tl::request& req, uint64_t batch_id,
@@ -107,13 +101,13 @@ void ReceiverProvider::on_passthrough(const tl::request& req, uint64_t batch_id,
     // Pull from SENDER (not broker)
     sender_bulk.on(sender_ep) >> local_bulk;
 
-    process_batch(batch_id, handle.data, size, checksum);
+    bool ok = process_batch(batch_id, handle.data, size, checksum);
 
     // Release buffer
     buffer_pool_->release(handle);
 
-    // Respond to broker (this is the ack that tells broker to ack sender)
-    req.respond(true);
+    // Response tells broker that pull is complete (broker then acks sender)
+    req.respond(ok);
 }
 
 void ReceiverProvider::on_done(const tl::request& req) {
@@ -128,7 +122,7 @@ void ReceiverProvider::on_done(const tl::request& req) {
     req.respond(true);
 }
 
-void ReceiverProvider::process_batch(uint64_t batch_id, const void* data,
+bool ReceiverProvider::process_batch(uint64_t batch_id, const void* data,
                                       size_t size, uint32_t expected_checksum) {
     // Verify checksum if enabled
     if (verify_checksums_ && expected_checksum != 0) {
@@ -137,21 +131,14 @@ void ReceiverProvider::process_batch(uint64_t batch_id, const void* data,
             std::cerr << "[Receiver] Checksum mismatch for batch " << batch_id
                       << ": expected " << expected_checksum << ", got " << actual
                       << std::endl;
+            return false;
         }
     }
-
-    // Optionally verify data pattern (more thorough but slower)
-    // if (verify_checksums_) {
-    //     if (!verify_test_pattern(data, size, batch_id)) {
-    //         std::cerr << "[Receiver] Pattern verification failed for batch "
-    //                   << batch_id << std::endl;
-    //     }
-    // }
 
     bytes_received_ += size;
     batches_received_++;
 
-    // Progress output periodically
+    // Progress output
     size_t total_batches = (total_bytes_ + config_.batch_size() - 1) /
                            config_.batch_size();
     if (total_batches >= 10 && batches_received_ % (total_batches / 10) == 0) {
@@ -159,14 +146,11 @@ void ReceiverProvider::process_batch(uint64_t batch_id, const void* data,
                   << total_batches << " batches (" << bytes_received_.load()
                   << " bytes)" << std::endl;
     }
-}
 
-void ReceiverProvider::ack_broker(const tl::endpoint& broker_ep, uint64_t batch_id) {
-    rpc_broker_ack_.on(broker_ep)(batch_id);
+    return true;
 }
 
 void ReceiverProvider::wait_completion() {
-    // Wait for done signal from broker
     {
         std::unique_lock<tl::mutex> lock(completion_mutex_);
         completion_cv_.wait(lock, [this] { return transfer_done_; });

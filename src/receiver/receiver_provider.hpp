@@ -19,22 +19,11 @@ namespace mochi_pipeline {
 /**
  * @brief ReceiverProvider handles receiving data from the broker.
  *
- * Supports receiving via:
- * - RPC_INLINE: Data received as RPC argument
- * - RDMA: Pull data from broker's buffer
- * - PASSTHROUGH: Pull data directly from sender's buffer
+ * Acknowledgement is implicit via RPC response - no separate ack RPC needed.
+ * When receiver calls req.respond(true), that acks the broker.
  */
 class ReceiverProvider : public tl::provider<ReceiverProvider> {
 public:
-    /**
-     * @brief Construct a receiver provider.
-     *
-     * @param engine Thallium engine
-     * @param provider_id Provider ID
-     * @param config Transfer configuration
-     * @param total_bytes Total bytes expected
-     * @param verify_checksums Enable checksum verification
-     */
     ReceiverProvider(tl::engine& engine, uint16_t provider_id,
                      const TransferConfig& config,
                      size_t total_bytes,
@@ -42,24 +31,10 @@ public:
 
     ~ReceiverProvider();
 
-    /**
-     * @brief Wait for all data to be received.
-     */
     void wait_completion();
 
-    /**
-     * @brief Get total bytes received.
-     */
     size_t get_bytes_received() const { return bytes_received_.load(); }
-
-    /**
-     * @brief Get elapsed time in seconds.
-     */
     double get_elapsed_seconds() const;
-
-    /**
-     * @brief Get latency statistics.
-     */
     const LatencyStats& get_latency_stats() const { return latency_stats_; }
 
 private:
@@ -74,11 +49,8 @@ private:
     void on_done(const tl::request& req);
 
     // Process received data
-    void process_batch(uint64_t batch_id, const void* data, size_t size,
+    bool process_batch(uint64_t batch_id, const void* data, size_t size,
                        uint32_t expected_checksum);
-
-    // Acknowledge broker
-    void ack_broker(const tl::endpoint& broker_ep, uint64_t batch_id);
 
     // Configuration
     TransferConfig config_;
@@ -103,9 +75,6 @@ private:
     bool first_recv_ = true;
     LatencyStats latency_stats_;
     tl::mutex stats_mutex_;
-
-    // RPCs
-    tl::remote_procedure rpc_broker_ack_;
 };
 
 } // namespace mochi_pipeline

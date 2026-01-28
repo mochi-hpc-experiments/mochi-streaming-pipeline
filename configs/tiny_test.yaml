@@ -1,0 +1,33 @@
+# Tiny test configuration for debugging
+# Minimal data transfer with RPC inline
+
+pipeline:
+  total_data_bytes: 1048576  # 1 MB only
+  network_protocol: "tcp"
+  verify_checksums: false
+
+  thallium:
+    progress_thread: true
+    rpc_thread_count: 2
+
+sender_to_broker:
+  message_size: 65536            # 64 KB
+  messages_per_batch: 4          # 256 KB per batch
+  max_concurrent_batches: 2
+  transfer_mode: "rpc_inline"
+
+broker:
+  output_file: "/tmp/pipeline_tiny_output.dat"
+  concurrent_rdma_pulls: 1
+  ack_timing: "ack_on_receive"
+  forward_strategy: "forward_immediate"
+  passthrough_persist: false
+
+  abt_io:
+    concurrent_writes: 2
+
+broker_to_receiver:
+  message_size: 65536
+  messages_per_batch: 4
+  max_concurrent_batches: 2
+  transfer_mode: "rpc_inline"

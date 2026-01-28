@@ -24,11 +24,11 @@ BrokerProvider::BrokerProvider(tl::engine& engine, uint16_t provider_id,
     , abt_io_(ABT_IO_INSTANCE_NULL)
     , file_fd_(-1)
 {
-    // Look up receiver endpoint
-    receiver_ep_ = engine_.lookup(receiver_address);
+    // Look up receiver endpoint and create provider handle (receiver uses provider_id 1)
+    tl::endpoint receiver_ep = engine_.lookup(receiver_address);
+    receiver_ph_ = tl::provider_handle(receiver_ep, 1);
 
     // Initialize ABT-IO
-    // Use JSON config for io_uring support if needed
     std::string json_config = "{\"backing_thread_count\": " +
                                std::to_string(broker_config_.abt_io.concurrent_writes) + "}";
     struct abt_io_init_info init_info;
@@ -52,30 +52,26 @@ BrokerProvider::BrokerProvider(tl::engine& engine, uint16_t provider_id,
     // Create buffer pools
     size_t recv_batch_size = recv_config_.batch_size();
 
-    // Determine bulk mode for receive pool based on forwarding strategy
     tl::bulk_mode recv_mode = tl::bulk_mode::write_only;
     if (broker_config_.forward_strategy == ForwardStrategy::REUSE_AFTER_PERSIST ||
         broker_config_.forward_strategy == ForwardStrategy::FORWARD_IMMEDIATE) {
-        // Need read-write if we'll forward from the same buffer
         recv_mode = tl::bulk_mode::read_write;
     }
 
-    // Only create recv_pool for RDMA modes (not needed for RPC_INLINE)
     if (recv_config_.mode != TransferMode::RPC_INLINE) {
         recv_pool_ = std::make_unique<BufferPool>(
             engine_, recv_batch_size,
             recv_config_.max_concurrent_batches + 2,
             recv_mode,
-            true  // Register for RDMA
+            true
         );
     }
 
-    // Create reload pool for RELOAD_FROM_FILE strategy
     if (broker_config_.forward_strategy == ForwardStrategy::RELOAD_FROM_FILE) {
         reload_pool_ = std::make_unique<BufferPool>(
             engine_, recv_batch_size,
             send_config_.max_concurrent_batches + 2,
-            tl::bulk_mode::read_only,  // Read-only since we're pushing to receiver
+            tl::bulk_mode::read_only,
             true
         );
     }
@@ -84,10 +80,8 @@ BrokerProvider::BrokerProvider(tl::engine& engine, uint16_t provider_id,
     define("broker_batch_rpc", &BrokerProvider::on_batch_rpc);
     define("broker_batch_rdma", &BrokerProvider::on_batch_rdma);
     define("broker_sender_done", &BrokerProvider::on_sender_done);
-    define("broker_receiver_ack", &BrokerProvider::on_receiver_ack);
 
-    // Get remote procedures
-    rpc_sender_ack_ = engine_.define("sender_ack");
+    // Get remote procedures to receiver
     rpc_forward_rpc_ = engine_.define("receiver_batch_rpc");
     rpc_forward_rdma_ = engine_.define("receiver_batch_rdma");
     rpc_forward_passthrough_ = engine_.define("receiver_batch_passthrough");
@@ -112,10 +106,8 @@ BrokerProvider::~BrokerProvider() {
 
 void BrokerProvider::on_batch_rpc(const tl::request& req, uint64_t batch_id,
                                    const std::vector<char>& data, uint32_t checksum) {
-    // Data received inline via RPC
     void* data_ptr = const_cast<char*>(data.data());
     size_t size = data.size();
-
     tl::endpoint sender_ep = req.get_endpoint();
 
     process_batch(req, batch_id, data_ptr, size, checksum,
@@ -127,15 +119,12 @@ void BrokerProvider::on_batch_rdma(const tl::request& req, uint64_t batch_id,
                                     uint32_t checksum) {
     tl::endpoint sender_ep = req.get_endpoint();
 
-    // Acquire a receive buffer
     BufferPool::Handle recv_handle = recv_pool_->acquire();
 
-    // Pull data from sender via RDMA
     std::vector<std::pair<void*, size_t>> segments;
     segments.emplace_back(recv_handle.data, size);
     tl::bulk local_bulk = engine_.expose(segments, tl::bulk_mode::write_only);
 
-    // Pull: local << remote.on(sender)
     remote_bulk.on(sender_ep) >> local_bulk;
 
     process_batch(req, batch_id, recv_handle.data, size, checksum,
@@ -152,31 +141,6 @@ void BrokerProvider::on_sender_done(const tl::request& req) {
     completion_cv_.notify_all();
 
     req.respond(true);
-}
-
-void BrokerProvider::on_receiver_ack(const tl::request& req, uint64_t batch_id) {
-    {
-        std::lock_guard<tl::mutex> lock(forward_mutex_);
-
-        auto it = inflight_forwards_.find(batch_id);
-        if (it != inflight_forwards_.end()) {
-            // Release receive buffer if applicable
-            if (it->second.has_recv_handle && recv_pool_) {
-                recv_pool_->release(it->second.recv_handle);
-            }
-            inflight_forwards_.erase(it);
-        }
-
-        inflight_forward_count_--;
-        batches_forwarded_++;
-    }
-
-    forward_cv_.notify_one();
-    req.respond(true);
-}
-
-void BrokerProvider::ack_sender(const tl::endpoint& sender_ep, uint64_t batch_id) {
-    rpc_sender_ack_.on(sender_ep)(batch_id);
 }
 
 void BrokerProvider::write_to_file(const void* data, size_t size, off_t offset) {
@@ -196,32 +160,40 @@ void BrokerProvider::read_from_file(void* data, size_t size, off_t offset) {
     }
 }
 
-void BrokerProvider::forward_rpc_inline(uint64_t batch_id, const void* data,
+bool BrokerProvider::forward_rpc_inline(uint64_t batch_id, const void* data,
                                          size_t size, uint32_t checksum) {
     std::vector<char> data_vec(static_cast<const char*>(data),
                                 static_cast<const char*>(data) + size);
 
-    // Call receiver's RPC handler
-    rpc_forward_rpc_.on(receiver_ep_)(batch_id, data_vec, checksum);
-    bytes_forwarded_ += size;
+    bool success = rpc_forward_rpc_.on(receiver_ph_)(batch_id, data_vec, checksum);
+    if (success) {
+        bytes_forwarded_ += size;
+        batches_forwarded_++;
+    }
+    return success;
 }
 
-void BrokerProvider::forward_rdma(uint64_t batch_id, void* data, size_t size,
+bool BrokerProvider::forward_rdma(uint64_t batch_id, void* data, size_t size,
                                    tl::bulk& local_bulk, uint32_t checksum) {
-    // Notify receiver to pull from broker
-    rpc_forward_rdma_.on(receiver_ep_)(batch_id, size, local_bulk, checksum);
-    bytes_forwarded_ += size;
+    bool success = rpc_forward_rdma_.on(receiver_ph_)(batch_id, size, local_bulk, checksum);
+    if (success) {
+        bytes_forwarded_ += size;
+        batches_forwarded_++;
+    }
+    return success;
 }
 
-void BrokerProvider::forward_passthrough(uint64_t batch_id, size_t size,
+bool BrokerProvider::forward_passthrough(uint64_t batch_id, size_t size,
                                           tl::bulk& sender_bulk,
                                           const std::string& sender_addr,
                                           uint32_t checksum) {
-    // Forward sender's bulk handle to receiver
-    // Receiver will pull directly from sender
-    rpc_forward_passthrough_.on(receiver_ep_)(batch_id, size, sender_bulk,
-                                               sender_addr, checksum);
-    bytes_forwarded_ += size;
+    bool success = rpc_forward_passthrough_.on(receiver_ph_)(batch_id, size, sender_bulk,
+                                                              sender_addr, checksum);
+    if (success) {
+        bytes_forwarded_ += size;
+        batches_forwarded_++;
+    }
+    return success;
 }
 
 void BrokerProvider::process_batch(const tl::request& req, uint64_t batch_id,
@@ -235,6 +207,9 @@ void BrokerProvider::process_batch(const tl::request& req, uint64_t batch_id,
             std::cerr << "[Broker] Checksum mismatch for batch " << batch_id
                       << ": expected " << expected_checksum << ", got " << actual
                       << std::endl;
+            if (recv_handle && recv_pool_) {
+                recv_pool_->release(*recv_handle);
+            }
             req.respond(false);
             return;
         }
@@ -243,54 +218,37 @@ void BrokerProvider::process_batch(const tl::request& req, uint64_t batch_id,
     bytes_received_ += size;
     batches_received_++;
 
-    // Get file offset atomically
     off_t offset = file_offset_.fetch_add(size);
 
-    // Handle based on strategy
     switch (broker_config_.forward_strategy) {
 
     case ForwardStrategy::RELOAD_FROM_FILE: {
         // Write to file first
         write_to_file(data, size, offset);
 
-        // Ack sender after persist
-        if (broker_config_.ack_timing == AckTiming::ACK_ON_PERSIST) {
-            ack_sender(sender_ep, batch_id);
-        }
-        req.respond(true);
-
-        // Release receive buffer if we have one (no longer needed)
+        // Release receive buffer (no longer needed)
         if (recv_handle && recv_pool_) {
             recv_pool_->release(*recv_handle);
+            recv_handle = nullptr;
         }
 
         // Reload from file into fresh buffer
         auto reload_handle = reload_pool_->acquire();
         read_from_file(reload_handle.data, size, offset);
 
-        // Wait for forward slot
-        {
-            std::unique_lock<tl::mutex> lock(forward_mutex_);
-            forward_cv_.wait(lock, [this] {
-                return inflight_forward_count_ < send_config_.max_concurrent_batches;
-            });
-            inflight_forward_count_++;
-
-            InFlightForward fwd;
-            fwd.recv_handle = std::move(reload_handle);
-            fwd.has_recv_handle = true;
-            fwd.timer.start();
-            inflight_forwards_[batch_id] = std::move(fwd);
-        }
-
-        // Forward to receiver
+        // Forward to receiver (blocking - response is ack)
+        bool forward_ok;
         if (send_config_.mode == TransferMode::RPC_INLINE) {
-            forward_rpc_inline(batch_id, inflight_forwards_[batch_id].recv_handle.data,
-                               size, expected_checksum);
+            forward_ok = forward_rpc_inline(batch_id, reload_handle.data, size, expected_checksum);
         } else {
-            forward_rdma(batch_id, inflight_forwards_[batch_id].recv_handle.data, size,
-                         inflight_forwards_[batch_id].recv_handle.bulk, expected_checksum);
+            forward_ok = forward_rdma(batch_id, reload_handle.data, size,
+                                      reload_handle.bulk, expected_checksum);
         }
+
+        reload_pool_->release(reload_handle);
+
+        // Respond to sender (this is the sender's ack)
+        req.respond(forward_ok);
         break;
     }
 
@@ -298,162 +256,117 @@ void BrokerProvider::process_batch(const tl::request& req, uint64_t batch_id,
         // Write to file first
         write_to_file(data, size, offset);
 
-        // Ack sender after persist
-        if (broker_config_.ack_timing == AckTiming::ACK_ON_PERSIST) {
-            ack_sender(sender_ep, batch_id);
-        }
-        req.respond(true);
-
-        // Wait for forward slot
-        {
-            std::unique_lock<tl::mutex> lock(forward_mutex_);
-            forward_cv_.wait(lock, [this] {
-                return inflight_forward_count_ < send_config_.max_concurrent_batches;
-            });
-            inflight_forward_count_++;
-
-            InFlightForward fwd;
-            if (recv_handle) {
-                fwd.recv_handle = std::move(*recv_handle);
-                fwd.has_recv_handle = true;
-            } else {
-                fwd.has_recv_handle = false;
-            }
-            fwd.timer.start();
-            inflight_forwards_[batch_id] = std::move(fwd);
-        }
-
-        // Forward from same buffer
+        // Forward from same buffer (blocking - response is ack)
+        bool forward_ok;
         if (send_config_.mode == TransferMode::RPC_INLINE) {
-            forward_rpc_inline(batch_id, data, size, expected_checksum);
-            // Release buffer after inline forward (data was copied)
-            if (inflight_forwards_[batch_id].has_recv_handle) {
-                recv_pool_->release(inflight_forwards_[batch_id].recv_handle);
-                inflight_forwards_[batch_id].has_recv_handle = false;
-            }
+            forward_ok = forward_rpc_inline(batch_id, data, size, expected_checksum);
+        } else if (recv_handle) {
+            forward_ok = forward_rdma(batch_id, data, size,
+                                      recv_handle->bulk, expected_checksum);
         } else {
-            // For RDMA, need to expose the buffer we have
-            if (recv_handle) {
-                forward_rdma(batch_id, data, size,
-                             inflight_forwards_[batch_id].recv_handle.bulk, expected_checksum);
-            } else {
-                // RPC inline data - need to create bulk
-                std::vector<std::pair<void*, size_t>> segments;
-                segments.emplace_back(data, size);
-                tl::bulk bulk = engine_.expose(segments, tl::bulk_mode::read_only);
-                forward_rdma(batch_id, data, size, bulk, expected_checksum);
-            }
+            // RPC inline data - need to create bulk for forwarding
+            std::vector<std::pair<void*, size_t>> segments;
+            segments.emplace_back(data, size);
+            tl::bulk bulk = engine_.expose(segments, tl::bulk_mode::read_only);
+            forward_ok = forward_rdma(batch_id, data, size, bulk, expected_checksum);
         }
+
+        // Release receive buffer after forward completes
+        if (recv_handle && recv_pool_) {
+            recv_pool_->release(*recv_handle);
+        }
+
+        // Respond to sender
+        req.respond(forward_ok);
         break;
     }
 
     case ForwardStrategy::FORWARD_IMMEDIATE: {
-        // Ack sender immediately
-        if (broker_config_.ack_timing == AckTiming::ACK_ON_RECEIVE) {
-            ack_sender(sender_ep, batch_id);
-        }
-        req.respond(true);
-
         // Start async file write
-        ssize_t* write_ret = new ssize_t;
+        ssize_t write_ret;
         abt_io_op_t* write_op = abt_io_pwrite_nb(abt_io_, file_fd_,
-                                                  data, size, offset, write_ret);
+                                                  data, size, offset, &write_ret);
 
-        // Wait for forward slot
-        {
-            std::unique_lock<tl::mutex> lock(forward_mutex_);
-            forward_cv_.wait(lock, [this] {
-                return inflight_forward_count_ < send_config_.max_concurrent_batches;
-            });
-            inflight_forward_count_++;
-
-            InFlightForward fwd;
-            if (recv_handle) {
-                fwd.recv_handle = std::move(*recv_handle);
-                fwd.has_recv_handle = true;
-            } else {
-                fwd.has_recv_handle = false;
-            }
-            fwd.timer.start();
-            inflight_forwards_[batch_id] = std::move(fwd);
-        }
-
-        // Forward to receiver in parallel with file write
+        // Forward to receiver in parallel (blocking RPC)
+        bool forward_ok;
         if (send_config_.mode == TransferMode::RPC_INLINE) {
-            forward_rpc_inline(batch_id, data, size, expected_checksum);
+            forward_ok = forward_rpc_inline(batch_id, data, size, expected_checksum);
+        } else if (recv_handle) {
+            forward_ok = forward_rdma(batch_id, data, size,
+                                      recv_handle->bulk, expected_checksum);
         } else {
-            if (recv_handle) {
-                forward_rdma(batch_id, data, size,
-                             inflight_forwards_[batch_id].recv_handle.bulk, expected_checksum);
-            } else {
-                std::vector<std::pair<void*, size_t>> segments;
-                segments.emplace_back(data, size);
-                tl::bulk bulk = engine_.expose(segments, tl::bulk_mode::read_only);
-                forward_rdma(batch_id, data, size, bulk, expected_checksum);
-            }
+            std::vector<std::pair<void*, size_t>> segments;
+            segments.emplace_back(data, size);
+            tl::bulk bulk = engine_.expose(segments, tl::bulk_mode::read_only);
+            forward_ok = forward_rdma(batch_id, data, size, bulk, expected_checksum);
         }
 
-        // Wait for file write to complete before we can release buffer
+        // Wait for file write to complete
         abt_io_op_wait(write_op);
-        bytes_written_ += size;
-        abt_io_op_free(write_op);
-        delete write_ret;
-
-        // Ack sender after persist if not already done
-        if (broker_config_.ack_timing == AckTiming::ACK_ON_PERSIST) {
-            ack_sender(sender_ep, batch_id);
+        if (write_ret == static_cast<ssize_t>(size)) {
+            bytes_written_ += size;
         }
+        abt_io_op_free(write_op);
+
+        // Release receive buffer
+        if (recv_handle && recv_pool_) {
+            recv_pool_->release(*recv_handle);
+        }
+
+        // Respond to sender based on ack_timing
+        // For FORWARD_IMMEDIATE, we've already forwarded, so respond based on config
+        req.respond(forward_ok);
         break;
     }
 
     case ForwardStrategy::PASSTHROUGH: {
-        // Passthrough requires RDMA (sender_bulk must be valid)
         if (!sender_bulk) {
             std::cerr << "[Broker] Passthrough strategy requires RDMA transfer mode"
                       << std::endl;
+            if (recv_handle && recv_pool_) {
+                recv_pool_->release(*recv_handle);
+            }
             req.respond(false);
             return;
         }
 
         bool file_write_started = false;
         abt_io_op_t* write_op = nullptr;
-        ssize_t* write_ret = nullptr;
+        ssize_t write_ret;
 
         // Optionally write to file in parallel
         if (broker_config_.passthrough_persist) {
-            // We already pulled the data for the write
-            write_ret = new ssize_t;
             write_op = abt_io_pwrite_nb(abt_io_, file_fd_,
-                                        data, size, offset, write_ret);
+                                        data, size, offset, &write_ret);
             file_write_started = true;
         }
 
-        // Forward sender's bulk handle to receiver
+        // Forward sender's bulk handle to receiver (blocking - receiver pulls from sender)
         auto sender_addr = static_cast<std::string>(sender_ep);
-        forward_passthrough(batch_id, size, *sender_bulk, sender_addr, expected_checksum);
+        bool forward_ok = forward_passthrough(batch_id, size, *sender_bulk,
+                                               sender_addr, expected_checksum);
 
         // Wait for file write if started
         if (file_write_started) {
             abt_io_op_wait(write_op);
-            bytes_written_ += size;
+            if (write_ret == static_cast<ssize_t>(size)) {
+                bytes_written_ += size;
+            }
             abt_io_op_free(write_op);
-            delete write_ret;
         }
 
-        // Release receive buffer if we have one
+        // Release receive buffer
         if (recv_handle && recv_pool_) {
             recv_pool_->release(*recv_handle);
         }
 
-        // Ack sender after receiver has pulled (passthrough completes synchronously
-        // in our implementation since forward_passthrough is blocking RPC)
-        ack_sender(sender_ep, batch_id);
-        req.respond(true);
+        // Respond to sender (receiver has completed its pull)
+        req.respond(forward_ok);
         break;
     }
     }
 
-    // Progress output periodically
+    // Progress output
     size_t total_batches = (total_bytes_ + recv_config_.batch_size() - 1) /
                            recv_config_.batch_size();
     if (total_batches >= 10 && batches_received_ % (total_batches / 10) == 0) {
@@ -469,16 +382,8 @@ void BrokerProvider::wait_completion() {
         completion_cv_.wait(lock, [this] { return sender_done_; });
     }
 
-    // Wait for all forwards to complete
-    {
-        std::unique_lock<tl::mutex> lock(forward_mutex_);
-        forward_cv_.wait(lock, [this] {
-            return inflight_forwards_.empty();
-        });
-    }
-
     // Signal receiver that we're done
-    rpc_receiver_done_.on(receiver_ep_)();
+    rpc_receiver_done_.on(receiver_ph_)();
 
     total_timer_.stop();
 

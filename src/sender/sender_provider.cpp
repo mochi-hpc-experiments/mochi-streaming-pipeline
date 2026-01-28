@@ -8,7 +8,8 @@ SenderProvider::SenderProvider(tl::engine& engine, uint16_t provider_id,
                                const TransferConfig& config,
                                const std::string& broker_address,
                                size_t total_bytes,
-                               bool verify_checksums)
+                               bool verify_checksums,
+                               size_t num_sender_xstreams)
     : tl::provider<SenderProvider>(engine, provider_id)
     , config_(config)
     , total_bytes_(total_bytes)
@@ -16,28 +17,26 @@ SenderProvider::SenderProvider(tl::engine& engine, uint16_t provider_id,
     , engine_(engine)
 {
     // Look up broker endpoint
-    broker_ep_ = engine_.lookup(broker_address);
+    broker_ph_ = tl::provider_handle{engine_.lookup(broker_address), 1};
 
     // Set up buffer pool for RDMA_REGISTERED mode
     size_t batch_size = config_.batch_size();
     if (config_.mode == TransferMode::RDMA_REGISTERED) {
-        // Create buffer pool with read_only mode (broker will pull)
         buffer_pool_ = std::make_unique<BufferPool>(
             engine_, batch_size,
-            config_.max_concurrent_batches + 2,  // Extra buffers for overlap
+            config_.max_concurrent_batches + 2,
             tl::bulk_mode::read_only,
-            true  // Register for RDMA
+            true
         );
     }
 
-    // Create scratch buffer for RPC_INLINE and RDMA_DIRECT modes
-    if (config_.mode == TransferMode::RPC_INLINE ||
-        config_.mode == TransferMode::RDMA_DIRECT) {
-        scratch_buffer_ = std::make_unique<char[]>(batch_size);
+    // Create pool and execution streams for sender ULTs
+    sender_pool_ = tl::pool::create(tl::pool::access::mpmc);
+    for (size_t i = 0; i < num_sender_xstreams; i++) {
+        sender_xstreams_.push_back(
+            tl::xstream::create(tl::scheduler::predef::basic_wait, *sender_pool_)
+        );
     }
-
-    // Define RPC handler for acknowledgments from broker
-    define("sender_ack", &SenderProvider::on_ack);
 
     // Get remote procedures to broker
     rpc_batch_rpc_ = engine_.define("broker_batch_rpc");
@@ -46,148 +45,93 @@ SenderProvider::SenderProvider(tl::engine& engine, uint16_t provider_id,
 }
 
 SenderProvider::~SenderProvider() {
-    // Buffer pool cleanup handled by unique_ptr
+    // Join and clean up xstreams
+    for (auto& xs : sender_xstreams_) {
+        xs->join();
+    }
 }
 
-void SenderProvider::on_ack(const tl::request& req, uint64_t batch_id) {
-    double latency = 0.0;
-    bool is_pool_buffer = false;
-
-    {
-        std::lock_guard<tl::mutex> lock(inflight_mutex_);
-
-        auto it = inflight_batches_.find(batch_id);
-        if (it != inflight_batches_.end()) {
-            latency = it->second.timer.elapsed_seconds();
-            is_pool_buffer = it->second.is_pool_buffer;
-
-            // Release pool buffer if applicable
-            if (is_pool_buffer && buffer_pool_) {
-                buffer_pool_->release(it->second.pool_handle);
-            }
-
-            inflight_batches_.erase(it);
-        }
-
-        inflight_count_--;
-        batches_acked_++;
-    }
-
-    // Record latency stats (outside lock)
-    if (latency > 0) {
-        std::lock_guard<tl::mutex> lock(stats_mutex_);
-        latency_stats_.record(latency);
-    }
-
-    // Signal that a slot is available
-    inflight_cv_.notify_one();
-
-    req.respond(true);
-}
-
-void SenderProvider::wait_for_slot() {
-    std::unique_lock<tl::mutex> lock(inflight_mutex_);
-    inflight_cv_.wait(lock, [this] {
+void SenderProvider::acquire_slot() {
+    std::unique_lock<tl::mutex> lock(slot_mutex_);
+    slot_cv_.wait(lock, [this] {
         return inflight_count_ < config_.max_concurrent_batches;
     });
     inflight_count_++;
 }
 
-void SenderProvider::release_slot(uint64_t batch_id) {
-    // This is called if we need to release without waiting for ack (error case)
-    std::lock_guard<tl::mutex> lock(inflight_mutex_);
-
-    auto it = inflight_batches_.find(batch_id);
-    if (it != inflight_batches_.end()) {
-        if (it->second.is_pool_buffer && buffer_pool_) {
-            buffer_pool_->release(it->second.pool_handle);
-        }
-        inflight_batches_.erase(it);
+void SenderProvider::release_slot() {
+    {
+        std::lock_guard<tl::mutex> lock(slot_mutex_);
+        inflight_count_--;
     }
-
-    inflight_count_--;
-    inflight_cv_.notify_one();
+    slot_cv_.notify_one();
 }
 
 uint32_t SenderProvider::generate_batch_data(void* buffer, size_t size, uint64_t batch_id) {
-    // Fill with deterministic pattern
     fill_test_pattern(buffer, size, batch_id);
-
-    // Compute checksum if verification is enabled
     if (verify_checksums_) {
         return compute_crc32(buffer, size);
     }
     return 0;
 }
 
-void SenderProvider::send_rpc_inline(uint64_t batch_id, void* data, size_t size) {
-    // Generate data
-    uint32_t checksum = generate_batch_data(data, size, batch_id);
+void SenderProvider::send_batch_ult(uint64_t batch_id, size_t size) {
+    Timer batch_timer;
+    batch_timer.start();
 
-    // Create vector from data (will be serialized as RPC argument)
-    std::vector<char> data_vec(static_cast<char*>(data),
-                                static_cast<char*>(data) + size);
+    bool success = false;
 
-    // Track in-flight batch for latency measurement
-    {
-        std::lock_guard<tl::mutex> lock(inflight_mutex_);
-        InFlightBatch batch;
-        batch.timer.start();
-        batch.is_pool_buffer = false;
-        inflight_batches_[batch_id] = std::move(batch);
+    switch (config_.mode) {
+        case TransferMode::RPC_INLINE: {
+            // Allocate temporary buffer, generate data, send as RPC argument
+            std::vector<char> data_vec(size);
+            uint32_t checksum = generate_batch_data(data_vec.data(), size, batch_id);
+
+            // Blocking RPC - response is the acknowledgement
+            success = rpc_batch_rpc_.on(broker_ph_)(batch_id, data_vec, checksum);
+            break;
+        }
+
+        case TransferMode::RDMA_DIRECT: {
+            // Allocate temporary buffer, generate data, expose for RDMA
+            std::vector<char> buffer(size);
+            uint32_t checksum = generate_batch_data(buffer.data(), size, batch_id);
+
+            std::vector<std::pair<void*, size_t>> segments;
+            segments.emplace_back(buffer.data(), size);
+            tl::bulk bulk = engine_.expose(segments, tl::bulk_mode::read_only);
+
+            // Blocking RPC - broker pulls data, response is acknowledgement
+            success = rpc_batch_rdma_.on(broker_ph_)(batch_id, size, bulk, checksum);
+            // bulk handle and buffer remain valid until RPC returns
+            break;
+        }
+
+        case TransferMode::RDMA_REGISTERED: {
+            // Acquire pre-registered buffer from pool
+            auto handle = buffer_pool_->acquire();
+            uint32_t checksum = generate_batch_data(handle.data, size, batch_id);
+
+            // Blocking RPC - broker pulls data, response is acknowledgement
+            success = rpc_batch_rdma_.on(broker_ph_)(batch_id, size, handle.bulk, checksum);
+
+            // Release buffer back to pool after RPC completes
+            buffer_pool_->release(handle);
+            break;
+        }
     }
 
-    // Send RPC with data as argument
-    // Broker will respond with ack
-    rpc_batch_rpc_.on(broker_ep_)(batch_id, data_vec, checksum);
-}
+    batch_timer.stop();
 
-void SenderProvider::send_rdma_direct(uint64_t batch_id, void* data, size_t size) {
-    // Generate data
-    uint32_t checksum = generate_batch_data(data, size, batch_id);
-
-    // Expose buffer for RDMA (broker will pull)
-    std::vector<std::pair<void*, size_t>> segments;
-    segments.emplace_back(data, size);
-    tl::bulk bulk = engine_.expose(segments, tl::bulk_mode::read_only);
-
-    // Track in-flight batch
-    {
-        std::lock_guard<tl::mutex> lock(inflight_mutex_);
-        InFlightBatch batch;
-        batch.bulk = std::move(bulk);
-        batch.timer.start();
-        batch.is_pool_buffer = false;
-        inflight_batches_[batch_id] = std::move(batch);
+    // Update statistics
+    if (success) {
+        batches_acked_++;
+        std::lock_guard<tl::mutex> lock(stats_mutex_);
+        latency_stats_.record(batch_timer.elapsed_seconds());
     }
 
-    // Notify broker to pull data
-    // We need to get the bulk handle back to pass to the RPC
-    tl::bulk& batch_bulk = inflight_batches_[batch_id].bulk;
-    rpc_batch_rdma_.on(broker_ep_)(batch_id, size, batch_bulk, checksum);
-}
-
-void SenderProvider::send_rdma_registered(uint64_t batch_id,
-                                          BufferPool::Handle& handle,
-                                          size_t actual_size) {
-    // Generate data into the pool buffer
-    uint32_t checksum = generate_batch_data(handle.data, actual_size, batch_id);
-
-    // Track in-flight batch (buffer remains exposed via pool)
-    {
-        std::lock_guard<tl::mutex> lock(inflight_mutex_);
-        InFlightBatch batch;
-        batch.pool_handle = std::move(handle);
-        batch.timer.start();
-        batch.is_pool_buffer = true;
-        inflight_batches_[batch_id] = std::move(batch);
-    }
-
-    // Get reference to the bulk handle from the tracked batch
-    tl::bulk& batch_bulk = inflight_batches_[batch_id].pool_handle.bulk;
-
-    // Notify broker to pull data
-    rpc_batch_rdma_.on(broker_ep_)(batch_id, actual_size, batch_bulk, checksum);
+    // Release slot to allow next batch
+    release_slot();
 }
 
 void SenderProvider::run() {
@@ -200,56 +144,50 @@ void SenderProvider::run() {
 
     total_timer_.start();
 
-    for (uint64_t batch_id = 0; batch_id < total_batches; batch_id++) {
-        // Wait for a slot if at max concurrent batches
-        wait_for_slot();
+    // Spawn ULTs for each batch to allow concurrent sends
+    std::vector<tl::managed<tl::thread>> ults;
+    ults.reserve(total_batches);
 
-        // Calculate actual size for this batch (last batch may be smaller)
+    for (uint64_t batch_id = 0; batch_id < total_batches; batch_id++) {
+        // Wait for a slot before spawning
+        acquire_slot();
+
+        // Calculate actual size for this batch
         size_t remaining = total_bytes_ - batch_id * batch_size;
         size_t this_batch_size = std::min(batch_size, remaining);
-
-        switch (config_.mode) {
-            case TransferMode::RPC_INLINE:
-                send_rpc_inline(batch_id, scratch_buffer_.get(), this_batch_size);
-                break;
-
-            case TransferMode::RDMA_DIRECT:
-                send_rdma_direct(batch_id, scratch_buffer_.get(), this_batch_size);
-                break;
-
-            case TransferMode::RDMA_REGISTERED: {
-                auto handle = buffer_pool_->acquire();
-                send_rdma_registered(batch_id, handle, this_batch_size);
-                break;
-            }
-        }
 
         batches_sent_++;
         bytes_sent_ += this_batch_size;
 
-        // Progress output every 10% or 100 batches
+        // Spawn ULT on sender pool to send this batch
+        auto ult = sender_pool_->make_thread(
+            [this, batch_id, this_batch_size]() {
+                send_batch_ult(batch_id, this_batch_size);
+            }
+        );
+        ults.push_back(std::move(ult));
+
+        // Progress output
         if (total_batches >= 10 && batch_id > 0 &&
-            (batch_id % (total_batches / 10) == 0 || batch_id % 100 == 0)) {
+            batch_id % (total_batches / 10) == 0) {
             std::cout << "[Sender] Progress: " << batch_id << "/" << total_batches
                       << " batches (" << (batch_id * 100 / total_batches) << "%)"
                       << std::endl;
         }
     }
 
-    // Wait for all acknowledgments
-    {
-        std::unique_lock<tl::mutex> lock(inflight_mutex_);
-        inflight_cv_.wait(lock, [this, total_batches] {
-            return batches_acked_ >= total_batches;
-        });
+    // Wait for all ULTs to complete
+    for (auto& ult : ults) {
+        ult->join();
     }
 
     total_timer_.stop();
 
     // Signal broker that sender is done
-    rpc_sender_done_.on(broker_ep_)();
+    rpc_sender_done_.on(broker_ph_)();
 
-    std::cout << "[Sender] Transfer complete: " << bytes_sent_.load() << " bytes in "
+    std::cout << "[Sender] Transfer complete: " << bytes_sent_.load() << " bytes, "
+              << batches_acked_.load() << " batches acked in "
               << total_timer_.elapsed_seconds() << " seconds" << std::endl;
 }
 

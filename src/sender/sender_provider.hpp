@@ -6,7 +6,7 @@
 #include <thallium/serialization/stl/string.hpp>
 #include <atomic>
 #include <memory>
-#include <unordered_map>
+#include <vector>
 
 #include "common/config.hpp"
 #include "common/buffer_pool.hpp"
@@ -24,24 +24,17 @@ namespace mochi_pipeline {
  * - RPC_INLINE: Data sent as RPC argument
  * - RDMA_DIRECT: Buffer exposed per batch, broker pulls
  * - RDMA_REGISTERED: Pre-registered buffer pool, broker pulls
+ *
+ * Acknowledgement is implicit via RPC response - no separate ack RPC needed.
  */
 class SenderProvider : public tl::provider<SenderProvider> {
 public:
-    /**
-     * @brief Construct a sender provider.
-     *
-     * @param engine Thallium engine
-     * @param provider_id Provider ID
-     * @param config Transfer configuration
-     * @param broker_address Address of the broker
-     * @param total_bytes Total bytes to send
-     * @param verify_checksums Enable checksum verification
-     */
     SenderProvider(tl::engine& engine, uint16_t provider_id,
                    const TransferConfig& config,
                    const std::string& broker_address,
                    size_t total_bytes,
-                   bool verify_checksums);
+                   bool verify_checksums,
+                   size_t num_sender_xstreams = 4);
 
     ~SenderProvider();
 
@@ -50,48 +43,22 @@ public:
      */
     void run();
 
-    /**
-     * @brief Get elapsed time in seconds.
-     */
     double get_elapsed_seconds() const;
-
-    /**
-     * @brief Get total bytes sent.
-     */
     size_t get_bytes_sent() const { return bytes_sent_.load(); }
-
-    /**
-     * @brief Get total batches sent.
-     */
     size_t get_batches_sent() const { return batches_sent_.load(); }
-
-    /**
-     * @brief Get total batches acknowledged.
-     */
     size_t get_batches_acked() const { return batches_acked_.load(); }
-
-    /**
-     * @brief Get latency statistics.
-     */
     const LatencyStats& get_latency_stats() const { return latency_stats_; }
 
 private:
-    // RPC handler called by broker to acknowledge batch
-    void on_ack(const tl::request& req, uint64_t batch_id);
-
-    // Transfer implementations
-    void send_rpc_inline(uint64_t batch_id, void* data, size_t size);
-    void send_rdma_direct(uint64_t batch_id, void* data, size_t size);
-    void send_rdma_registered(uint64_t batch_id, BufferPool::Handle& handle, size_t actual_size);
+    // Send batch in a ULT (allows concurrency, RPC response is ack)
+    void send_batch_ult(uint64_t batch_id, size_t size);
 
     // Generate batch data and return checksum if enabled
     uint32_t generate_batch_data(void* buffer, size_t size, uint64_t batch_id);
 
-    // Wait for an available slot in the in-flight batches
-    void wait_for_slot();
-
-    // Release a slot after batch is acknowledged
-    void release_slot(uint64_t batch_id);
+    // Concurrency control
+    void acquire_slot();
+    void release_slot();
 
     // Configuration
     TransferConfig config_;
@@ -100,26 +67,18 @@ private:
 
     // Engine and broker endpoint
     tl::engine& engine_;
-    tl::endpoint broker_ep_;
+    tl::provider_handle broker_ph_;
 
     // Buffer pool for RDMA_REGISTERED mode
     std::unique_ptr<BufferPool> buffer_pool_;
 
-    // Scratch buffer for RPC_INLINE and RDMA_DIRECT modes
-    std::unique_ptr<char[]> scratch_buffer_;
+    // Pool and execution streams for spawning sender ULTs
+    tl::managed<tl::pool> sender_pool_;
+    std::vector<tl::managed<tl::xstream>> sender_xstreams_;
 
-    // Tracking in-flight batches for RDMA modes (need to keep bulk handles alive)
-    struct InFlightBatch {
-        tl::bulk bulk;                   // Bulk handle (for RDMA_DIRECT)
-        BufferPool::Handle pool_handle;  // Pool handle (for RDMA_REGISTERED)
-        Timer timer;                     // For latency measurement
-        bool is_pool_buffer;
-    };
-    std::unordered_map<uint64_t, InFlightBatch> inflight_batches_;
-
-    // Concurrency control using Argobots primitives
-    tl::mutex inflight_mutex_;
-    tl::condition_variable inflight_cv_;
+    // Concurrency control
+    tl::mutex slot_mutex_;
+    tl::condition_variable slot_cv_;
     size_t inflight_count_ = 0;
 
     // Statistics
@@ -132,9 +91,9 @@ private:
     Timer total_timer_;
 
     // RPCs to broker
-    tl::remote_procedure rpc_batch_rpc_;      // Send batch via RPC arg
-    tl::remote_procedure rpc_batch_rdma_;     // Notify broker of RDMA batch
-    tl::remote_procedure rpc_sender_done_;    // Signal completion
+    tl::remote_procedure rpc_batch_rpc_;
+    tl::remote_procedure rpc_batch_rdma_;
+    tl::remote_procedure rpc_sender_done_;
 };
 
 } // namespace mochi_pipeline

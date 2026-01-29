@@ -1,0 +1,216 @@
+# =============================================================================
+# Mochi Streaming Pipeline Benchmark - Configuration Template
+# =============================================================================
+#
+# This file documents all configuration parameters with their default values,
+# descriptions, and allowed values.
+#
+# The benchmark transfers data through a 3-process pipeline:
+#   Sender (Rank 0) -> Broker (Rank 1) -> Receiver (Rank 2)
+#
+# The Broker persists data to disk while forwarding to the Receiver.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Pipeline-level settings
+# -----------------------------------------------------------------------------
+pipeline:
+  # Total amount of data to transfer in bytes.
+  # This is the total payload size that will flow through the pipeline.
+  # Examples: 1073741824 (1 GB), 107374182400 (100 GB)
+  # Default: 107374182400 (100 GB)
+  total_data_bytes: 107374182400
+
+  # Network protocol for Thallium/Mercury communication.
+  # Allowed values:
+  #   - "tcp"        : TCP sockets (works everywhere, lower performance)
+  #   - "verbs"      : libfabric InfiniBand verbs (requires RDMA hardware)
+  #   - "gni"        : libfabric Cray GNI (for Cray systems)
+  #   - "cxi"        : libfabric Cray CXI (for Cray systems)
+  #   - "na+sm"      : shared memory (single node only)
+  #   - ...          : any other protocol allowed by Mercury/libfabric
+  # Default: "tcp"
+  network_protocol: "tcp"
+
+  # Enable CRC32 checksum verification for data integrity.
+  # When true, sender computes checksums and broker/receiver verify them.
+  # Adds CPU overhead but catches data corruption.
+  # Allowed values: true, false
+  # Default: true
+  verify_checksums: true
+
+  # Thallium engine configuration
+  thallium:
+    # Use a dedicated thread for Mercury progress.
+    # Recommended: true for better RPC responsiveness.
+    # Allowed values: true, false
+    # Default: true
+    progress_thread: true
+
+    # Number of execution streams (threads) for handling RPCs.
+    # Higher values allow more concurrent RPC processing.
+    # Also controls the number of sender ULTs for concurrent batch sends.
+    # Typical range: 1-16
+    # Default: 4
+    rpc_thread_count: 4
+
+# -----------------------------------------------------------------------------
+# Sender to Broker transfer configuration
+# -----------------------------------------------------------------------------
+sender_to_broker:
+  # Size of each individual message in bytes.
+  # Batches are composed of multiple messages.
+  # Typical range: 65536 (64 KB) to 4194304 (4 MB)
+  # Default: 1048576 (1 MB)
+  message_size: 1048576
+
+  # Number of messages grouped into each batch.
+  # Batch size = message_size * messages_per_batch
+  # Higher values increase throughput but also memory usage.
+  # Typical range: 1-16
+  # Default: 4 (creates 4 MB batches with 1 MB messages)
+  messages_per_batch: 4
+
+  # Maximum number of batches in flight simultaneously.
+  # Controls concurrency and memory usage.
+  # Higher values can improve throughput but increase memory.
+  # Typical range: 2-16
+  # Default: 4
+  max_concurrent_batches: 4
+
+  # Data transfer mode from Sender to Broker.
+  # Allowed values:
+  #   - "rpc_inline"      : Data sent as RPC argument (simple, works everywhere)
+  #   - "rdma_direct"     : RDMA with per-batch buffer registration (flexible)
+  #   - "rdma_registered" : RDMA with pre-registered buffer pool (best performance)
+  # Note: RDMA modes require compatible network protocol (e.g., ofi+verbs)
+  # Default: "rdma_registered"
+  transfer_mode: "rdma_registered"
+
+# -----------------------------------------------------------------------------
+# Broker configuration
+# -----------------------------------------------------------------------------
+broker:
+  # Path to the output file where broker persists received data.
+  # Should be on a fast storage device for best performance.
+  # Default: "/tmp/pipeline_output.dat"
+  output_file: "/tmp/pipeline_output.dat"
+
+  # Maximum concurrent RDMA pull operations.
+  # Only relevant for RDMA transfer modes.
+  # Typical range: 1-8
+  # Default: 4
+  concurrent_rdma_pulls: 4
+
+  # When to acknowledge receipt to the sender.
+  # Allowed values:
+  #   - "ack_on_persist" : Ack after data is written to disk (safer)
+  #   - "ack_on_receive" : Ack after data is received in memory (faster)
+  # Default: "ack_on_persist"
+  ack_timing: "ack_on_persist"
+
+  # Strategy for forwarding data to the receiver.
+  # Allowed values:
+  #   - "reload_from_file"    : Write to disk, then read back and forward
+  #                             (most conservative, highest latency)
+  #   - "reuse_after_persist" : Write to disk, then forward from same buffer
+  #                             (good balance of safety and performance)
+  #   - "forward_immediate"   : Start forwarding immediately, write in parallel
+  #                             (best throughput, data in memory until acked)
+  #   - "passthrough"         : Pass sender's RDMA handle directly to receiver
+  #                             (lowest latency, requires RDMA, sender buffer
+  #                             held until receiver completes pull)
+  # Default: "reuse_after_persist"
+  forward_strategy: "reuse_after_persist"
+
+  # Write data to file even in passthrough mode.
+  # Only relevant when forward_strategy is "passthrough".
+  # When true, broker writes to disk in parallel with receiver pull.
+  # Allowed values: true, false
+  # Default: true
+  passthrough_persist: true
+
+  # ABT-IO (Argobots I/O) configuration for async file operations
+  abt_io:
+    # Number of backing threads for concurrent file writes.
+    # Higher values allow more parallel I/O operations.
+    # Should match storage device parallelism.
+    # Typical range: 1-16
+    # Default: 4
+    concurrent_writes: 4
+
+    # Number of io_uring instances for Linux io_uring support.
+    # Set to 1 or higher to enable liburing backend.
+    # Each uring has a dedicated internal execution stream.
+    # If > 1, operations are issued round-robin across rings.
+    # Operations not supported by uring fall back to normal abt-io pool.
+    # Requires Linux kernel 5.1+ and liburing.
+    # Set to 0 to disable (use traditional pwrite/pread).
+    # Typical range: 0-4
+    # Default: 0 (disabled)
+    num_urings: 0
+
+    # Optional flags for the liburing engine.
+    # Only relevant when num_urings > 0.
+    # Allowed values (can combine multiple):
+    #   - "IOSQE_ASYNC"              : Force async execution
+    #   - "IORING_SETUP_SQPOLL"      : Kernel-side submission polling
+    #   - "IORING_SETUP_COOP_TASKRUN": Cooperative task running
+    #   - "IORING_SETUP_SINGLE_ISSUER": Single task submits (optimization)
+    #   - "IORING_SETUP_DEFER_TASKRUN": Defer task running
+    # Default: [] (empty, use liburing defaults)
+    # Example for high-performance NVMe:
+    #   liburing_flags: ["IORING_SETUP_SQPOLL", "IORING_SETUP_SINGLE_ISSUER"]
+    liburing_flags: []
+
+# -----------------------------------------------------------------------------
+# Broker to Receiver transfer configuration
+# -----------------------------------------------------------------------------
+broker_to_receiver:
+  # Size of each individual message in bytes.
+  # Typically matches sender_to_broker for simplicity.
+  # Default: 1048576 (1 MB)
+  message_size: 1048576
+
+  # Number of messages per batch.
+  # Typically matches sender_to_broker.
+  # Default: 4
+  messages_per_batch: 4
+
+  # Maximum concurrent batches in flight to receiver.
+  # Default: 4
+  max_concurrent_batches: 4
+
+  # Data transfer mode from Broker to Receiver.
+  # Allowed values: same as sender_to_broker.transfer_mode
+  # Note: "passthrough" forward_strategy requires matching RDMA mode
+  # between sender_to_broker and broker_to_receiver.
+  # Default: "rdma_registered"
+  transfer_mode: "rdma_registered"
+
+# =============================================================================
+# Example configurations for common scenarios:
+# =============================================================================
+#
+# High Throughput (InfiniBand):
+#   network_protocol: "ofi+verbs"
+#   transfer_mode: "rdma_registered" (both)
+#   forward_strategy: "forward_immediate"
+#   max_concurrent_batches: 8-16
+#   message_size: 4194304 (4 MB)
+#
+# Strong Consistency:
+#   forward_strategy: "reload_from_file"
+#   ack_timing: "ack_on_persist"
+#   verify_checksums: true
+#
+# Lowest Latency (requires RDMA):
+#   forward_strategy: "passthrough"
+#   transfer_mode: "rdma_registered" (both)
+#
+# TCP-only (no RDMA hardware):
+#   network_protocol: "tcp"
+#   transfer_mode: "rpc_inline" (both)
+#   forward_strategy: "forward_immediate"
+#
+# =============================================================================

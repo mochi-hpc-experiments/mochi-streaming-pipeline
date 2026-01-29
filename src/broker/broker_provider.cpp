@@ -28,16 +28,35 @@ BrokerProvider::BrokerProvider(tl::engine& engine, uint16_t provider_id,
     tl::endpoint receiver_ep = engine_.lookup(receiver_address);
     receiver_ph_ = tl::provider_handle(receiver_ep, 1);
 
-    // Initialize ABT-IO
+    // Initialize ABT-IO with JSON configuration
     std::string json_config = "{\"backing_thread_count\": " +
-                               std::to_string(broker_config_.abt_io.concurrent_writes) + "}";
+                               std::to_string(broker_config_.abt_io.concurrent_writes);
+
+    // Add liburing support if num_urings > 0
+    if (broker_config_.abt_io.num_urings > 0) {
+        json_config += ", \"num_urings\": " +
+                       std::to_string(broker_config_.abt_io.num_urings);
+
+        // Add liburing flags if specified
+        if (!broker_config_.abt_io.liburing_flags.empty()) {
+            json_config += ", \"liburing_flags\": [";
+            for (size_t i = 0; i < broker_config_.abt_io.liburing_flags.size(); ++i) {
+                if (i > 0) json_config += ", ";
+                json_config += "\"" + broker_config_.abt_io.liburing_flags[i] + "\"";
+            }
+            json_config += "]";
+        }
+    }
+
+    json_config += "}";
+
     struct abt_io_init_info init_info;
     memset(&init_info, 0, sizeof(init_info));
     init_info.json_config = json_config.c_str();
 
     abt_io_ = abt_io_init_ext(&init_info);
     if (abt_io_ == ABT_IO_INSTANCE_NULL) {
-        throw std::runtime_error("Failed to initialize ABT-IO");
+        throw std::runtime_error("Failed to initialize ABT-IO with config: " + json_config);
     }
 
     // Open output file

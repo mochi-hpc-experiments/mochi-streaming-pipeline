@@ -93,6 +93,15 @@ TransferConfig parse_transfer_config(const YAML::Node& node) {
 AbtIoConfig parse_abt_io_config(const YAML::Node& node) {
     AbtIoConfig config;
     config.concurrent_writes = get_or_default<size_t>(node, "concurrent_writes", 8);
+    config.num_urings = get_or_default<size_t>(node, "num_urings", 0);
+
+    // Parse liburing_flags array
+    if (node["liburing_flags"]) {
+        for (const auto& flag : node["liburing_flags"]) {
+            config.liburing_flags.push_back(flag.as<std::string>());
+        }
+    }
+
     return config;
 }
 
@@ -123,6 +132,8 @@ BrokerConfig parse_broker_config(const YAML::Node& node) {
         config.abt_io = parse_abt_io_config(node["abt_io"]);
     } else {
         config.abt_io.concurrent_writes = 8;
+        config.abt_io.num_urings = 0;
+        // liburing_flags left empty by default
     }
 
     return config;
@@ -185,6 +196,7 @@ PipelineConfig PipelineConfig::from_yaml(const std::string& path) {
         config.broker.forward_strategy = ForwardStrategy::REUSE_AFTER_PERSIST;
         config.broker.passthrough_persist = true;
         config.broker.abt_io.concurrent_writes = 8;
+        config.broker.abt_io.num_urings = 0;
     }
 
     // Parse broker_to_receiver config

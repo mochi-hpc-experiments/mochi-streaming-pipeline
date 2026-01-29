@@ -1,0 +1,33 @@
+# Test configuration with io_uring enabled
+pipeline:
+  total_data_bytes: 67108864  # 64 MB
+  network_protocol: "tcp"
+  verify_checksums: true
+
+  thallium:
+    progress_thread: true
+    rpc_thread_count: 4
+
+sender_to_broker:
+  message_size: 1048576       # 1 MB
+  messages_per_batch: 4       # 4 MB batches
+  max_concurrent_batches: 4
+  transfer_mode: "rpc_inline"
+
+broker:
+  output_file: "/tmp/pipeline_uring_test.dat"
+  concurrent_rdma_pulls: 4
+  ack_timing: "ack_on_persist"
+  forward_strategy: "forward_immediate"
+  passthrough_persist: true
+
+  abt_io:
+    concurrent_writes: 4
+    num_urings: 2
+    liburing_flags: ["IOSQE_ASYNC"]
+
+broker_to_receiver:
+  message_size: 1048576
+  messages_per_batch: 4
+  max_concurrent_batches: 4
+  transfer_mode: "rpc_inline"

@@ -3,6 +3,7 @@
 
 #include <yaml-cpp/yaml.h>
 #include <string>
+#include <vector>
 #include <cstdint>
 #include <stdexcept>
 
@@ -42,7 +43,9 @@ struct TransferConfig {
 
 // ABT-IO configuration
 struct AbtIoConfig {
-    size_t concurrent_writes;       // Max concurrent pwrite operations
+    size_t concurrent_writes;       // Max concurrent pwrite operations (backing_thread_count)
+    size_t num_urings;              // Number of io_uring instances (0 = disabled)
+    std::vector<std::string> liburing_flags;  // Flags for liburing engine
 };
 
 // Thallium configuration

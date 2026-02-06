@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup spack
+        uses: spack/setup-spack@v2.1.1
+        with:
+          ref: develop
+
+      - name: Install spack environment
+        run: |
+          spack -e tests install
+
+      - name: Show spack-installed packages for debugging
+        run: |
+          spack -e tests find -dlv
+
+      - name: Build code and run tests
+        run: |
+          eval `spack env activate --sh tests`
+          mkdir build
+          cd build
+          cmake ..
+          make -j$(nproc)
+          ctest --output-on-failure --timeout 120

@@ -1,0 +1,30 @@
+# Test: Small messages
+# Many small messages per batch
+
+pipeline:
+  total_data_bytes: 2097152  # 2 MB
+  network_protocol: "tcp"
+  verify_checksums: true
+  thallium:
+    progress_thread: true
+    rpc_thread_count: 2
+
+sender_to_broker:
+  message_size: 65536         # 64 KB
+  messages_per_batch: 8       # 512 KB batches
+  max_concurrent_batches: 4
+  transfer_mode: "rpc_inline"
+
+broker:
+  output_file: "/tmp/test_small_messages.dat"
+  concurrent_rdma_pulls: 2
+  ack_timing: "ack_on_persist"
+  forward_strategy: "reuse_after_persist"
+  abt_io:
+    concurrent_writes: 2
+
+broker_to_receiver:
+  message_size: 65536
+  messages_per_batch: 8
+  max_concurrent_batches: 4
+  transfer_mode: "rpc_inline"

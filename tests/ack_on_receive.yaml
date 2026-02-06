@@ -1,0 +1,30 @@
+# Test: ack_on_receive timing
+# Broker acks immediately after receiving data (before disk write)
+
+pipeline:
+  total_data_bytes: 4194304  # 4 MB
+  network_protocol: "tcp"
+  verify_checksums: true
+  thallium:
+    progress_thread: true
+    rpc_thread_count: 2
+
+sender_to_broker:
+  message_size: 524288        # 512 KB
+  messages_per_batch: 2       # 1 MB batches
+  max_concurrent_batches: 4
+  transfer_mode: "rpc_inline"
+
+broker:
+  output_file: "/tmp/test_ack_on_receive.dat"
+  concurrent_rdma_pulls: 2
+  ack_timing: "ack_on_receive"
+  forward_strategy: "forward_immediate"
+  abt_io:
+    concurrent_writes: 2
+
+broker_to_receiver:
+  message_size: 524288
+  messages_per_batch: 2
+  max_concurrent_batches: 4
+  transfer_mode: "rpc_inline"

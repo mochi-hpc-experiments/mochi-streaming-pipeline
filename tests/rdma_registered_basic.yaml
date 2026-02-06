@@ -1,0 +1,30 @@
+# Test: RDMA registered buffer pool transfer mode
+# Both legs use pre-registered RDMA buffers
+
+pipeline:
+  total_data_bytes: 8388608  # 8 MB
+  network_protocol: "tcp"
+  verify_checksums: true
+  thallium:
+    progress_thread: true
+    rpc_thread_count: 2
+
+sender_to_broker:
+  message_size: 524288        # 512 KB
+  messages_per_batch: 4       # 2 MB batches
+  max_concurrent_batches: 2
+  transfer_mode: "rdma_registered"
+
+broker:
+  output_file: "/tmp/test_rdma_registered.dat"
+  concurrent_rdma_pulls: 2
+  ack_timing: "ack_on_persist"
+  forward_strategy: "reuse_after_persist"
+  abt_io:
+    concurrent_writes: 2
+
+broker_to_receiver:
+  message_size: 524288
+  messages_per_batch: 4
+  max_concurrent_batches: 2
+  transfer_mode: "rdma_registered"

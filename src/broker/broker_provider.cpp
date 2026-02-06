@@ -60,8 +60,15 @@ BrokerProvider::BrokerProvider(tl::engine& engine, uint16_t provider_id,
     }
 
     // Open output file
+    // Use O_RDWR if we need to read back (reload_from_file strategy)
+    int open_flags = O_CREAT | O_TRUNC;
+    if (broker_config_.forward_strategy == ForwardStrategy::RELOAD_FROM_FILE) {
+        open_flags |= O_RDWR;
+    } else {
+        open_flags |= O_WRONLY;
+    }
     file_fd_ = abt_io_open(abt_io_, broker_config_.output_file.c_str(),
-                           O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                           open_flags, 0644);
     if (file_fd_ < 0) {
         abt_io_finalize(abt_io_);
         throw std::runtime_error("Failed to open output file: " +

@@ -1,0 +1,30 @@
+# Test: High concurrency
+# Many in-flight batches and threads
+
+pipeline:
+  total_data_bytes: 16777216  # 16 MB
+  network_protocol: "tcp"
+  verify_checksums: true
+  thallium:
+    progress_thread: true
+    rpc_thread_count: 8
+
+sender_to_broker:
+  message_size: 262144        # 256 KB
+  messages_per_batch: 4       # 1 MB batches
+  max_concurrent_batches: 8
+  transfer_mode: "rdma_registered"
+
+broker:
+  output_file: "/tmp/test_high_concurrency.dat"
+  concurrent_rdma_pulls: 8
+  ack_timing: "ack_on_receive"
+  forward_strategy: "forward_immediate"
+  abt_io:
+    concurrent_writes: 8
+
+broker_to_receiver:
+  message_size: 262144
+  messages_per_batch: 4
+  max_concurrent_batches: 8
+  transfer_mode: "rdma_registered"

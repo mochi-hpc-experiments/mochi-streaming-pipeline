@@ -15,3 +15,11 @@ spack:
   packages:
     mochi-margo:
       require: "@0.22.0:"
+    mercury:
+      require:
+        - "~checksum"
+        - "~boostsys"
+        - "+ofi"
+    libfabric:
+      require:
+        - "fabrics=tcp,rxm"

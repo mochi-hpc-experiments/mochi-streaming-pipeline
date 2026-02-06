@@ -1,0 +1,30 @@
+# Test: forward_immediate forwarding strategy
+# Forward to receiver while writing to disk in parallel
+
+pipeline:
+  total_data_bytes: 8388608  # 8 MB
+  network_protocol: "tcp"
+  verify_checksums: true
+  thallium:
+    progress_thread: true
+    rpc_thread_count: 4
+
+sender_to_broker:
+  message_size: 524288        # 512 KB
+  messages_per_batch: 4       # 2 MB batches
+  max_concurrent_batches: 4
+  transfer_mode: "rdma_registered"
+
+broker:
+  output_file: "/tmp/test_forward_immediate.dat"
+  concurrent_rdma_pulls: 4
+  ack_timing: "ack_on_receive"
+  forward_strategy: "forward_immediate"
+  abt_io:
+    concurrent_writes: 4
+
+broker_to_receiver:
+  message_size: 524288
+  messages_per_batch: 4
+  max_concurrent_batches: 4
+  transfer_mode: "rdma_registered"

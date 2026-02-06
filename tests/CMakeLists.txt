@@ -42,3 +42,36 @@ endforeach ()
 # Report how many tests were found
 list (LENGTH TEST_YAML_FILES NUM_TESTS)
 message (STATUS "Found ${NUM_TESTS} integration test(s) in ${CMAKE_CURRENT_SOURCE_DIR}")
+
+# Python unit tests for the search module
+find_package (Python3 COMPONENTS Interpreter)
+if (Python3_FOUND)
+    # Check if pytest is available
+    execute_process (
+        COMMAND ${Python3_EXECUTABLE} -c "import pytest"
+        RESULT_VARIABLE PYTEST_NOT_FOUND
+        OUTPUT_QUIET
+        ERROR_QUIET
+    )
+
+    if (NOT PYTEST_NOT_FOUND)
+        add_test (
+            NAME python_search_unit_tests
+            COMMAND ${Python3_EXECUTABLE} -m pytest
+                    ${CMAKE_CURRENT_SOURCE_DIR}/unit/test_search.py
+                    -v
+            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        )
+
+        set_tests_properties (python_search_unit_tests PROPERTIES
+            TIMEOUT 60
+            LABELS "unit;python"
+        )
+
+        message (STATUS "Added Python unit tests (pytest found)")
+    else ()
+        message (STATUS "Skipping Python unit tests (pytest not found)")
+    endif ()
+else ()
+    message (STATUS "Skipping Python unit tests (Python3 not found)")
+endif ()

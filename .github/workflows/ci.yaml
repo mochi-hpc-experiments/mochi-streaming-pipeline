@@ -20,10 +20,12 @@ jobs:
         with:
           ref: develop
 
-      - name: Setup Mochi spack packages
+      - name: Setup spack package repos
         run: |
           git clone https://github.com/mochi-hpc/mochi-spack-packages.git
           spack repo add mochi-spack-packages
+          git clone https://github.com/deephyper/deephyper-spack-packages.git
+          spack repo add deephyper-spack-packages
 
       - name: Install spack environment
         run: |

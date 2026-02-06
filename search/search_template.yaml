@@ -1,0 +1,58 @@
+# Search Template for Mochi Streaming Pipeline
+#
+# This file defines the search space for DeepHyper parameter optimization.
+#
+# Special keys:
+#   _categorical: [opt1, opt2, ...] - Choose from discrete options
+#   _range: [min, max]              - Integer range (inclusive)
+#   _ordinal: [val1, val2, ...]     - Ordered discrete values
+#   Any other value                 - Treated as a constant
+#
+
+pipeline:
+  # Total data to transfer (constant for search - use smaller value for faster iterations)
+  total_data_bytes: 1073741824  # 1 GB
+
+  # Network protocol (constant)
+  network_protocol: "tcp"
+
+  # Disable checksums for faster benchmark runs during search
+  verify_checksums: false
+
+  thallium:
+    progress_thread: true
+    rpc_thread_count:
+      _range: [1, 8]
+
+sender_to_broker:
+  message_size:
+    _ordinal: [65536, 131072, 262144, 524288, 1048576, 2097152, 4194304]
+  messages_per_batch:
+    _range: [1, 16]
+  max_concurrent_batches:
+    _range: [1, 16]
+  transfer_mode:
+    _categorical: ["rpc_inline", "rdma_direct", "rdma_registered"]
+
+broker:
+  output_file: "/tmp/deephyper_benchmark.dat"
+  concurrent_rdma_pulls:
+    _range: [1, 16]
+  ack_timing:
+    _categorical: ["ack_on_persist", "ack_on_receive"]
+  forward_strategy:
+    _categorical: ["reload_from_file", "reuse_after_persist", "forward_immediate", "passthrough"]
+  passthrough_persist: true
+  abt_io:
+    concurrent_writes:
+      _range: [1, 16]
+
+broker_to_receiver:
+  message_size:
+    _ordinal: [65536, 131072, 262144, 524288, 1048576, 2097152, 4194304]
+  messages_per_batch:
+    _range: [1, 16]
+  max_concurrent_batches:
+    _range: [1, 16]
+  transfer_mode:
+    _categorical: ["rpc_inline", "rdma_direct", "rdma_registered"]

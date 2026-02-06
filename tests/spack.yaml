@@ -5,6 +5,10 @@ spack:
   - mochi-abt-io
   - yaml-cpp
   - mpich
+  - py-pydantic
+  - py-pyyaml
+  - py-pytest
+  - py-deephyper
   concretizer:
     unify: true
     reuse: true

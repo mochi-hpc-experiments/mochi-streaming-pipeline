@@ -5,6 +5,17 @@ spack:
   - mochi-abt-io
   - yaml-cpp
   - mpich
+  # for parameter space exploration
+  - py-pydantic
+  - py-pyyaml
+  - py-pytest
+  - py-deephyper
+  # py-deephyper requires the deephyper-spack-packages package repository:
+  #
+  # ```
+  # git clone https://github.com/deephyper/deephyper-spack-packages.git
+  # spack repo add deephyper-spack-packages
+  # ```
   concretizer:
     unify: true
     reuse: true

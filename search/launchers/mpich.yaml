@@ -1,0 +1,15 @@
+# Launcher configuration for MPICH's mpiexec
+#
+# Use this on systems with MPICH-based MPI implementations.
+
+launcher:
+  # Command template with host specification
+  # {hosts} is replaced with comma-separated hostnames from job.dequed
+  command_template: "mpiexec -n 3 -hosts {hosts} {benchmark_exe} {config_file}"
+
+  # Fallback when no hosts are provided (e.g., local testing)
+  command_template_no_hosts: "mpiexec -n 3 {benchmark_exe} {config_file}"
+
+  # Optional: environment variables
+  # environment:
+  #   MPICH_OFI_STARTUP_CONNECT: "1"

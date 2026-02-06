@@ -43,9 +43,8 @@ jobs:
           ctest --output-on-failure --timeout 120
 
       - name: Send coverage report
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: true
           verbose: true
-          gcov: true

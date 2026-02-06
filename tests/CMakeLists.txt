@@ -5,21 +5,23 @@
 # Success = exit code 0
 
 # Find MPI for mpirun/mpiexec
-find_package(MPI REQUIRED)
+find_package (MPI REQUIRED)
 
 # Get path to the benchmark executable
-set(BENCHMARK_EXE $<TARGET_FILE:pipeline_benchmark>)
+set (BENCHMARK_EXE $<TARGET_FILE:pipeline_benchmark>)
 
 # Find all YAML test configuration files in this directory
-file(GLOB TEST_YAML_FILES "${CMAKE_CURRENT_SOURCE_DIR}/*.yaml")
+# Exclude spack.yaml which is used for CI environment setup
+file (GLOB TEST_YAML_FILES "${CMAKE_CURRENT_SOURCE_DIR}/*.yaml")
+list (FILTER TEST_YAML_FILES EXCLUDE REGEX "spack\\.yaml$")
 
 # Create a test for each YAML file
-foreach(YAML_FILE ${TEST_YAML_FILES})
+foreach (YAML_FILE ${TEST_YAML_FILES})
     # Extract filename without path and extension for test name
-    get_filename_component(TEST_NAME ${YAML_FILE} NAME_WE)
+    get_filename_component (TEST_NAME ${YAML_FILE} NAME_WE)
 
     # Add the test
-    add_test(
+    add_test (
         NAME integration_${TEST_NAME}
         COMMAND ${MPIEXEC_EXECUTABLE}
                 ${MPIEXEC_NUMPROC_FLAG} 3
@@ -30,13 +32,13 @@ foreach(YAML_FILE ${TEST_YAML_FILES})
     )
 
     # Set test properties
-    set_tests_properties(integration_${TEST_NAME} PROPERTIES
+    set_tests_properties (integration_${TEST_NAME} PROPERTIES
         TIMEOUT 120
         PROCESSORS 3
         LABELS "integration"
     )
-endforeach()
+endforeach ()
 
 # Report how many tests were found
-list(LENGTH TEST_YAML_FILES NUM_TESTS)
-message(STATUS "Found ${NUM_TESTS} integration test(s) in ${CMAKE_CURRENT_SOURCE_DIR}")
+list (LENGTH TEST_YAML_FILES NUM_TESTS)
+message (STATUS "Found ${NUM_TESTS} integration test(s) in ${CMAKE_CURRENT_SOURCE_DIR}")

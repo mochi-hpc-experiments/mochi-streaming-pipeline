@@ -15,6 +15,15 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+          cache: 'pip' # caching pip dependencies
+
+      - name: Install python dependencies
+        run: |
+          pip install deephyper pytest pydantic pyyaml
+
       - name: Setup spack
         uses: spack/setup-spack@v2.1.1
         with:
@@ -24,8 +33,6 @@ jobs:
         run: |
           git clone https://github.com/mochi-hpc/mochi-spack-packages.git
           spack repo add mochi-spack-packages
-          git clone https://github.com/deephyper/deephyper-spack-packages.git
-          spack repo add deephyper-spack-packages
 
       - name: Install spack environment
         run: |
@@ -34,6 +41,10 @@ jobs:
       - name: Show spack-installed packages for debugging
         run: |
           spack -e tests find -dlv
+
+      - name: Install python environment
+        run: |
+          pip install deephyper pytest pydantic pyyaml
 
       - name: Build code and run tests
         run: |

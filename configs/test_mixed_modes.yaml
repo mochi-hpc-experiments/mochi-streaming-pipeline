@@ -1,0 +1,35 @@
+# Test mixed transfer modes:
+# - Sender -> Broker: RDMA with pre-registered buffers
+# - Broker -> Receiver: RPC inline (data in RPC arguments)
+
+pipeline:
+  total_data_bytes: 16777216  # 16 MB
+  network_protocol: "tcp"
+  verify_checksums: true
+
+  thallium:
+    progress_thread: true
+    rpc_thread_count: 4
+
+sender_to_broker:
+  message_size: 1048576       # 1 MB
+  messages_per_batch: 2       # 2 MB batches
+  max_concurrent_batches: 4
+  transfer_mode: "rdma_registered"  # RDMA with buffer pool
+
+broker:
+  output_file: "/tmp/pipeline_mixed_test.dat"
+  concurrent_rdma_pulls: 4
+  ack_timing: "ack_on_persist"
+  forward_strategy: "reuse_after_persist"
+  passthrough_persist: true
+
+  abt_io:
+    concurrent_writes: 4
+    num_urings: 0
+
+broker_to_receiver:
+  message_size: 1048576
+  messages_per_batch: 2
+  max_concurrent_batches: 4
+  transfer_mode: "rpc_inline"  # Forward using RPC arguments

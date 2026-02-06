@@ -1,0 +1,51 @@
+name: coverage
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test-coverage:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup spack
+        uses: spack/setup-spack@v2.1.1
+        with:
+          ref: develop
+
+      - name: Setup Mochi spack packages
+        run: |
+          git clone https://github.com/mochi-hpc/mochi-spack-packages.git
+          spack repo add mochi-spack-packages
+
+      - name: Install spack environment
+        run: |
+          spack -e tests install
+
+      - name: Show spack-installed packages for debugging
+        run: |
+          spack -e tests find -dlv
+
+      - name: Build code and run tests
+        run: |
+          eval `spack env activate --sh tests`
+          mkdir build
+          cd build
+          cmake .. -DENABLE_COVERAGE=ON
+          make -j$(nproc)
+          ctest --output-on-failure --timeout 120
+
+      - name: Send coverage report
+        uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: true
+          verbose: true
+          gcov: true
